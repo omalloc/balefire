@@ -15,6 +15,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/protocol"
 	"github.com/libp2p/go-libp2p/p2p/discovery/routing"
 	"github.com/multiformats/go-multiaddr"
+
 	"github.com/omalloc/balefire/api/transport"
 )
 
@@ -45,6 +46,7 @@ type p2pTransport struct {
 	host     host.Host
 	kadDHT   *dht.IpfsDHT
 	routing  *routing.RoutingDiscovery
+	stop     chan struct{}
 }
 
 func NewP2PTransport(opt Option) (transport.Transport, error) {
@@ -52,6 +54,7 @@ func NewP2PTransport(opt Option) (transport.Transport, error) {
 		mode:         opt.Mode,
 		protocol:     protocol.ID(defaultProtocol),
 		centralPeers: opt.CentralPeers,
+		stop:         make(chan struct{}, 1),
 	}
 
 	if len(opt.ListenAddrs) == 0 {
@@ -147,6 +150,11 @@ func (p *p2pTransport) Start(ctx context.Context) error {
 		log.Infof("advertised with ttl: %s", ttl.String())
 	}
 
+	// start a goroutine to periodically connect to peers
+	if p.mode == "leaf" {
+		go p.tickConnectPeers()
+	}
+
 	log.Infof("transport started with %s mode", p.mode)
 	return nil
 }
@@ -173,6 +181,36 @@ func (p *p2pTransport) dhtMode() dht.ModeOpt {
 		dhtMode = dht.ModeServer
 	}
 	return dhtMode
+}
+
+func (p *p2pTransport) tickConnectPeers() {
+
+	tick := time.NewTicker(time.Second * 5)
+
+	for {
+		select {
+		case <-tick.C:
+			peerCh, err := p.routing.FindPeers(context.Background(), defaultTag)
+			if err != nil {
+				log.Errorf("failed to find peers: %v", err)
+				continue
+			}
+
+			for pi := range peerCh {
+				if pi.ID == p.host.ID() {
+					continue
+				}
+
+				log.Infof("connecting to peer %s", pi.String())
+				if err := p.host.Connect(context.Background(), pi); err != nil {
+					log.Errorf("failed to connect to peer %s: %v", pi.String(), err)
+				}
+			}
+
+		case <-p.stop:
+			return
+		}
+	}
 }
 
 func (p *p2pTransport) handleStream(s network.Stream) {}

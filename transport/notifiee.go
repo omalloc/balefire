@@ -17,17 +17,9 @@ func (n *ConnNotifiee) Connected(net network.Network, c network.Conn) {
 		dir = "inbound"
 	}
 
-	log.Infof(
-		"%s peer %s addr %s",
-		dir,
-		c.RemotePeer(),
-		c.RemoteMultiaddr(),
-	)
+	log.Infof("%s peer %s addr %s", dir, c.RemotePeer(), c.RemoteMultiaddr())
 }
 
 func (n *ConnNotifiee) Disconnected(net network.Network, c network.Conn) {
-	log.Infof(
-		"disconnect peer %s",
-		c.RemotePeer(),
-	)
+	log.Infof("disconnect peer %s", c.RemotePeer())
 }
