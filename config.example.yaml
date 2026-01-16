@@ -1,0 +1,10 @@
+logging:
+  level: info
+  caller: false
+transport:
+  mode: server
+  private_key: "put-your-private-key-here"
+  public_key: "put-your-public-key-here"
+  listen_addrs:
+    - /ip4/0.0.0.0/tcp/5000
+  peers: []
