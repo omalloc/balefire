@@ -6,13 +6,14 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"strings"
 
 	"github.com/go-kratos/kratos/v2"
 	"github.com/go-kratos/kratos/v2/config"
 	"github.com/go-kratos/kratos/v2/config/file"
 	"github.com/go-kratos/kratos/v2/log"
 	"github.com/libp2p/go-libp2p/core/crypto"
+
+	transportv1 "github.com/omalloc/balefire/api/transport"
 	"github.com/omalloc/balefire/conf"
 	"github.com/omalloc/balefire/transport"
 )
@@ -20,7 +21,6 @@ import (
 var (
 	_               = ""
 	flagConf string = "config.yaml"
-	flagMode        = "leaf"
 	flagPkey bool
 
 	id, _   = os.Hostname()
@@ -30,7 +30,6 @@ var (
 
 func init() {
 	flag.StringVar(&flagConf, "conf", "config.yaml", "")
-	flag.StringVar(&flagMode, "mode", "leaf", "")
 	flag.BoolVar(&flagPkey, "pk", false, "")
 
 	log.SetLogger(log.With(log.DefaultLogger,
@@ -46,7 +45,7 @@ func main() {
 
 	// generate keypair
 	if flagPkey {
-		privBytes, pubBytes, err := GenerateEd25519Key()
+		privBytes, pubBytes, err := GenerateKeyPair()
 		if err != nil {
 			fmt.Printf("failed generate ED25519 KEY: %v", err)
 			os.Exit(1)
@@ -72,11 +71,10 @@ func main() {
 
 	// new transport
 	tr, err := transport.NewP2PTransport(transport.Option{
-		Mode:         bc.Transport.Mode,
+		Mode:         transportv1.Mode(bc.Transport.Mode),
 		Identity:     bc.Transport.PrivateKey,
 		ListenAddrs:  bc.Transport.ListenAddrs,
 		CentralPeers: bc.Transport.Peers,
-		// CentralPeers: withEnvironmentPeers(),
 	})
 	if err != nil {
 		panic(err)
@@ -101,12 +99,7 @@ func main() {
 	}
 }
 
-func withEnvironmentPeers() []string {
-	peers := os.Getenv("BALEFIRE_PEERS")
-	return strings.Split(peers, ",")
-}
-
-func GenerateEd25519Key() ([]byte, []byte, error) {
+func GenerateKeyPair() ([]byte, []byte, error) {
 	pk, uk, _ := crypto.GenerateEd25519Key(nil)
 
 	privBytes, err := crypto.MarshalPrivateKey(pk)

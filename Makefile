@@ -11,7 +11,7 @@ init:
 .PHONY: build
 # build binary
 build:
-	@mkdir -p bin/ && CGO_ENABLED=0 go build -ldflags "-s -w" -o ./bin/ ./...
+	@mkdir -p bin/ && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "-s -w -extldflags '-static'" -trimpath -o ./bin/ ./...
 
 .PHONY: clean
 # clean build artifacts
