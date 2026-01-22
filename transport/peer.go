@@ -1,7 +1,9 @@
 package transport
 
 import (
+	"bufio"
 	"context"
+	"fmt"
 	"sort"
 	"time"
 
@@ -10,6 +12,7 @@ import (
 	kbucket "github.com/libp2p/go-libp2p-kbucket"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/protocol"
 )
 
 func (p *p2pTransport) maintainClosestPeers(ctx context.Context, interval time.Duration) {
@@ -135,4 +138,154 @@ func findAndConnectClosestPeers(ctx context.Context, h host.Host, kdht *dht.Ipfs
 	}
 
 	return nil
+}
+
+func (p *p2pTransport) maintainLeafPeers(ctx context.Context, interval time.Duration) {
+
+	time.Sleep(time.Second * 10)
+
+	peerChan, err := p.routing.FindPeers(ctx, defaultNamespace)
+	if err != nil {
+		log.Warnf("failed to find peers for leaf maintenance: %v", err)
+		return
+	}
+
+	// maintain a local connection pool and a removal notifier
+	connected := make(map[peer.ID]struct{})
+	lostconnected := make(map[peer.ID]time.Time)
+	removeCh := make(chan peer.ID, 1)
+
+	ticker := time.NewTicker(time.Second * 15)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-p.stop:
+			return
+		case pidInfo, ok := <-peerChan:
+			if !ok {
+				// discovery channel closed: try to reopen (best-effort)
+				peerChan, err = p.routing.FindPeers(ctx, defaultNamespace)
+				if err != nil {
+					log.Warnf("failed to re-open peer discovery channel: %v", err)
+					ticker.Stop()
+
+					time.Sleep(time.Minute)
+					ticker = time.NewTicker(time.Second * 15)
+					continue
+				}
+				continue
+			}
+
+			if pidInfo.ID == p.host.ID() {
+				continue
+			}
+
+			if _, exists := connected[pidInfo.ID]; exists {
+				continue
+			}
+
+			if lostTime, exist := lostconnected[pidInfo.ID]; exist {
+				if time.Since(lostTime) < time.Minute { // wait 1 minutes before retrying
+					continue
+				} else {
+					delete(lostconnected, pidInfo.ID)
+				}
+			}
+
+			// try to create a stream to the discovered peer
+			stream, err := p.host.NewStream(ctx, pidInfo.ID, protocol.ID(defaultProtocol))
+			if err != nil {
+				log.Warnf("failed to create stream to peer %s: %v", pidInfo.ID, err)
+				lostconnected[pidInfo.ID] = time.Now()
+				continue
+			}
+
+			rw := bufio.NewReadWriter(bufio.NewReader(stream), bufio.NewWriter(stream))
+			connected[pidInfo.ID] = struct{}{}
+			log.Infof("leaf connected to peer %s", pidInfo.ID)
+
+			// read/write goroutines will notify removal via removeCh when they exit
+			go func(pid peer.ID, rw *bufio.ReadWriter) {
+				readData(pid, rw)
+				removeCh <- pid
+			}(pidInfo.ID, rw)
+
+			go func(pid peer.ID, rw *bufio.ReadWriter) {
+				writeData(rw)
+				removeCh <- pid
+			}(pidInfo.ID, rw)
+
+		case pid := <-removeCh:
+			if _, ok := connected[pid]; ok {
+				delete(connected, pid)
+				log.Infof("leaf disconnected from peer %s", pid)
+			}
+
+		case <-ticker.C:
+			// also ensure we attach to any already-connected peers (e.g., from other discovery paths)
+			for _, conn := range p.host.Network().Conns() {
+				peerID := conn.RemotePeer()
+				if peerID == p.host.ID() {
+					continue
+				}
+				if _, exists := connected[peerID]; exists {
+					continue
+				}
+
+				stream, err := p.host.NewStream(ctx, peerID, protocol.ID(defaultProtocol))
+				if err != nil {
+					log.Warnf("failed to create stream to existing conn peer %s: %v", peerID, err)
+					continue
+				}
+
+				rw := bufio.NewReadWriter(bufio.NewReader(stream), bufio.NewWriter(stream))
+				connected[peerID] = struct{}{}
+				log.Infof("leaf connected to peer (from Conns) %s", peerID)
+
+				go func(pid peer.ID, rw *bufio.ReadWriter) {
+					readData(pid, rw)
+					removeCh <- pid
+				}(peerID, rw)
+
+				go func(pid peer.ID, rw *bufio.ReadWriter) {
+					writeData(rw)
+					removeCh <- pid
+				}(peerID, rw)
+			}
+		}
+	}
+
+}
+
+func readData(peerID peer.ID, rw *bufio.ReadWriter) {
+	for {
+		str, err := rw.ReadString('\n')
+		if err != nil {
+			fmt.Println("Error reading from buffer")
+			return
+		}
+
+		if str == "" {
+			return
+		}
+		if str != "\n" {
+			// Green console colour: 	\x1b[32m
+			// Reset console colour: 	\x1b[0m
+			fmt.Printf("\x1b[32m[%s] From %s\x1b[0m > %s", time.Now().Format(time.TimeOnly), peerID.ShortString(), str)
+		}
+	}
+}
+
+func writeData(rw *bufio.ReadWriter) {
+	for range time.Tick(time.Second * 2) {
+		_, err := rw.WriteString("ping\n")
+		if err != nil {
+			fmt.Println("Error writing to buffer")
+			return
+		}
+		rw.Flush()
+	}
 }

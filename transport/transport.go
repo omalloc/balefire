@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"bufio"
 	"context"
 	"encoding/base64"
 	"fmt"
@@ -16,24 +17,25 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
 	"github.com/libp2p/go-libp2p/p2p/discovery/routing"
+	dutil "github.com/libp2p/go-libp2p/p2p/discovery/util"
 	"github.com/multiformats/go-multiaddr"
 
-	"github.com/omalloc/balefire/api/transport"
+	transportv1 "github.com/omalloc/balefire/api/transport"
 )
 
 // Note: A libp2p-backed Transport implementation will live in this package,
 // hidden behind the Transport interface to avoid leaking dependencies.
 
-var _ transport.Transport = (*p2pTransport)(nil)
+var _ transportv1.Transport = (*p2pTransport)(nil)
 
 const (
 	defaultProtocol   = "/balefire/1.0.0"
-	defaultTag        = "balefire-mdns"
+	defaultNamespace  = "rendezvous"
 	defaultListenAddr = "/ip4/0.0.0.0/tcp/0"
 )
 
 type Option struct {
-	Mode         transport.Mode
+	Mode         transportv1.Mode
 	Identity     string
 	CentralPeers []string
 	ListenAddrs  []string
@@ -50,7 +52,7 @@ type p2pTransport struct {
 	stop     chan struct{}
 }
 
-func NewP2PTransport(opt Option) (transport.Transport, error) {
+func NewP2PTransport(opt Option) (transportv1.Transport, error) {
 	tr := &p2pTransport{
 		opt:      opt,
 		protocol: protocol.ID(defaultProtocol),
@@ -63,7 +65,7 @@ func NewP2PTransport(opt Option) (transport.Transport, error) {
 
 	opts := make([]libp2p.Option, 0, 16)
 
-	if opt.Mode == transport.ModeServer {
+	if opt.Mode == transportv1.ModeServer {
 		opts = append(opts, tr.identity())
 	}
 
@@ -80,21 +82,12 @@ func NewP2PTransport(opt Option) (transport.Transport, error) {
 	}
 	tr.host = host
 
-	kadDHT, err := dht.New(context.Background(), host,
-		dht.Mode(tr.dhtMode()),                        // 设置DHT模式
-		dht.BucketSize(20),                            // 调整桶大小
-		dht.RoutingTableRefreshPeriod(10*time.Minute), // 调整路由表刷新周期
-	)
-	if err != nil {
-		log.Fatalf("failed to create DHT: %v", err)
-		return nil, err
-	}
-	tr.kdht = kadDHT
+	host.Network().Notify(&ConnNotifiee{})
 
 	return tr, nil
 }
 
-// Start implements [transport.Transport].
+// Start implements [transportv1.Transport].
 func (p *p2pTransport) Start(ctx context.Context) error {
 	log.Infof("transport starting with %s mode", p.opt.Mode)
 
@@ -103,23 +96,47 @@ func (p *p2pTransport) Start(ctx context.Context) error {
 		log.Infof("transport listening on %s/p2p/%s", addr.String(), hostID)
 	}
 
+	bootstrapPeers := make([]peer.AddrInfo, 0, len(p.opt.CentralPeers))
+	for _, addr := range p.opt.CentralPeers {
+		maddr, _ := multiaddr.NewMultiaddr(addr)
+		pi, _ := peer.AddrInfoFromP2pAddr(maddr)
+		if pi == nil {
+			continue
+		}
+		bootstrapPeers = append(bootstrapPeers, *pi)
+	}
+
+	kadDHT, err := dht.New(context.Background(), p.host,
+		dht.Mode(p.dhtMode()),                         // 设置DHT模式
+		dht.BucketSize(20),                            // 调整桶大小
+		dht.RoutingTableRefreshPeriod(10*time.Minute), // 调整路由表刷新周期
+		dht.BootstrapPeers(bootstrapPeers...),
+	)
+	if err != nil {
+		log.Fatalf("failed to create DHT: %v", err)
+		return err
+	}
+	p.kdht = kadDHT
+
 	// if in server mode, listen for incoming connections
 	// and serve DHT server
 	if err := p.kdht.Bootstrap(ctx); err != nil {
 		return err
 	}
 
-	p.host.Network().Notify(&ConnNotifiee{})
+	// Wait a bit to let bootstrapping finish (really bootstrap should block until it's ready, but that isn't the case yet.)
+	time.Sleep(time.Second)
+
+	// advertise self
+	p.advertise()
 
 	p.host.SetStreamHandler(p.protocol, p.handleStream)
 
-	// connect to central peers if in leaf mode
-	if p.opt.Mode == transport.ModeLeaf {
-		// connect to central peers
-		if err := p.connCentralPeers(); err != nil {
-			return err
-		}
+	// send messages to connected leaf nodes
+	go p.maintainLeafPeers(ctx, time.Minute)
 
+	// connect to central peers if in leaf mode
+	if p.opt.Mode == transportv1.ModeLeaf {
 		// start a goroutine to periodically connect to others peer
 		go p.maintainClosestPeers(ctx, time.Minute)
 	}
@@ -128,20 +145,20 @@ func (p *p2pTransport) Start(ctx context.Context) error {
 	return nil
 }
 
-// Stop implements [transport.Transport].
+// Stop implements [transportv1.Transport].
 func (p *p2pTransport) Stop(ctx context.Context) error {
 	p.stop <- struct{}{}
 	log.Infof("transport stopped")
 	return nil
 }
 
-// OnReceive implements [transport.Transport].
-func (p *p2pTransport) OnReceive(handler transport.Handler) {
+// OnReceive implements [transportv1.Transport].
+func (p *p2pTransport) OnReceive(handler transportv1.Handler) {
 	panic("unimplemented")
 }
 
-// Send implements [transport.Transport].
-func (p *p2pTransport) Send(ctx context.Context, dst string, message transport.Message) error {
+// Send implements [transportv1.Transport].
+func (p *p2pTransport) Send(ctx context.Context, dst string, message transportv1.Message) error {
 	maddr, err := multiaddr.NewMultiaddr(dst)
 	if err != nil {
 		return fmt.Errorf("parse multiaddr: %w", err)
@@ -202,11 +219,11 @@ func (p *p2pTransport) Send(ctx context.Context, dst string, message transport.M
 	case err := <-errCh:
 		return err
 	case b := <-ackCh:
-		var reply transport.Message
+		var reply transportv1.Message = NewEmptyMessage()
 		if err := reply.Unmarshal(b); err != nil {
 			return fmt.Errorf("unmarshal ack: %w", err)
 		}
-		if reply.GetKind() != transport.KindACK || reply.GetID() != message.GetID() {
+		if reply.GetKind() != transportv1.KindACK || reply.GetID() != message.GetID() {
 			return fmt.Errorf("invalid ACK")
 		}
 	}
@@ -217,39 +234,20 @@ func (p *p2pTransport) Send(ctx context.Context, dst string, message transport.M
 // dhtMode returns the DHT mode based on the config transport mode.
 func (p *p2pTransport) dhtMode() dht.ModeOpt {
 	dhtMode := dht.ModeClient
-	if p.opt.Mode == transport.ModeServer {
+	if p.opt.Mode == transportv1.ModeServer {
 		dhtMode = dht.ModeServer
 	}
 	return dhtMode
 }
 
-func (p *p2pTransport) connCentralPeers() error {
-
-	for _, addr := range p.opt.CentralPeers {
-		maddr, _ := multiaddr.NewMultiaddr(addr)
-		pi, _ := peer.AddrInfoFromP2pAddr(maddr)
-		if pi == nil {
-			continue
-		}
-
-		log.Infof("connect to central peer %s", pi.String())
-		if err := p.host.Connect(context.Background(), *pi); err != nil {
-			log.Errorf("failed to connect to central peer %s: %v", addr, err)
-		}
-	}
+func (p *p2pTransport) advertise() error {
 
 	p.routing = routing.NewRoutingDiscovery(p.kdht)
 
-	time.Sleep(time.Second)
-
 	// register self leafnode with DHT
-	ttl, err := p.routing.Advertise(context.Background(), defaultTag)
-	if err != nil {
-		log.Errorf("failed to advertise: %v", err)
-		return err
-	}
-	log.Infof("advertised with ttl: %s", ttl.String())
+	dutil.Advertise(context.Background(), p.routing, defaultNamespace)
 
+	log.Infof("advertised self successfully announced with tag %s", defaultNamespace)
 	return nil
 }
 
@@ -269,6 +267,40 @@ func (p *p2pTransport) identity() libp2p.Option {
 	return libp2p.Identity(pk)
 }
 
-func (p *p2pTransport) handleStream(s network.Stream) {
-	log.Infof("new stream from %s", s.Conn().RemotePeer().String())
+func (p *p2pTransport) handleStream(stream network.Stream) {
+	log.Infof("new stream from %s", stream.Conn().RemotePeer().String())
+
+	// Create a buffer stream for non blocking read and write.
+	rw := bufio.NewReadWriter(bufio.NewReader(stream), bufio.NewWriter(stream))
+
+	go p.read(stream.Conn().RemotePeer(), rw)
+
+	go func(w *bufio.ReadWriter) {
+		w.Write([]byte("ok"))
+		w.Flush()
+	}(rw)
+
+}
+
+func (p *p2pTransport) read(id peer.ID, rw *bufio.ReadWriter) {
+	for {
+
+		str, err := rw.ReadString('\n')
+		if err != nil {
+			log.Errorf("Error reading from buffer: %v", err)
+			return
+		}
+
+		if str == "" {
+			return
+		}
+
+		if str != "\n" {
+
+			// Green console colour: 	\x1b[32m
+			// Reset console colour: 	\x1b[0m
+			fmt.Printf("\x1b[32m[%s] From %s\x1b[0m > %s\n", time.Now().Format(time.TimeOnly), id.ShortString(), str)
+		}
+
+	}
 }
