@@ -70,6 +70,17 @@ func main() {
 		panic(err)
 	}
 
+	app, err := newApp(&bc)
+	if err != nil {
+		panic(err)
+	}
+
+	if err := app.Run(); err != nil {
+		panic(err)
+	}
+}
+
+func newApp(bc *conf.Bootstrap) (*kratos.App, error) {
 	// new transport
 	tr, err := transport.NewP2PTransport(transport.Option{
 		Mode:         api_transport.Mode(bc.Transport.Mode),
@@ -78,15 +89,16 @@ func main() {
 		CentralPeers: bc.Transport.Peers,
 	})
 	if err != nil {
-		panic(err)
+		return nil, err
 	}
 
+	_ = os.MkdirAll(bc.Storage.Path, 0o755)
+
 	// new storage
-	store, err := storage.NewNutsDBStore("./data")
+	store, err := storage.NewNutsDBStore(bc.Storage.Path)
 	if err != nil {
-		panic(err)
+		return nil, err
 	}
-	defer store.Close()
 
 	// new outboxService
 	outboxService := transport.NewOutboxService(tr, store)
@@ -104,11 +116,12 @@ func main() {
 			log.Infof("%s started", name)
 			return nil
 		}),
+		kratos.AfterStop(func(ctx context.Context) error {
+			return store.Close()
+		}),
 	)
 
-	if err := app.Run(); err != nil {
-		panic(err)
-	}
+	return app, nil
 }
 
 func GenerateKeyPair() ([]byte, []byte, error) {

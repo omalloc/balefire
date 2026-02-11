@@ -3,6 +3,7 @@ package conf
 type Bootstrap struct {
 	Logging   Logging   `yaml:"logging" json:"logging"`
 	Transport Transport `yaml:"transport" json:"transport"`
+	Storage   Storage   `yaml:"storage" json:"storage"`
 }
 
 type Logging struct {
@@ -16,4 +17,8 @@ type Transport struct {
 	PublicKey   string   `yaml:"public_key" json:"public_key"`
 	ListenAddrs []string `yaml:"listen_addrs" json:"listen_addrs"`
 	Peers       []string `yaml:"peers" json:"peers"`
+}
+
+type Storage struct {
+	Path string `yaml:"path" json:"path"`
 }

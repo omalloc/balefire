@@ -8,3 +8,5 @@ transport:
   listen_addrs:
     - /ip4/0.0.0.0/tcp/5000
   peers: []
+storage:
+  path: /var/lib/balefire

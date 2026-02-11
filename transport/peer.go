@@ -6,10 +6,12 @@ import (
 	"time"
 
 	"github.com/go-kratos/kratos/v2/log"
+	"github.com/google/uuid"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
 	kbucket "github.com/libp2p/go-libp2p-kbucket"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
+	pb "github.com/omalloc/balefire/api/transport/v1"
 )
 
 func (p *p2pTransport) maintainClosestPeers(ctx context.Context, interval time.Duration) {
@@ -30,6 +32,37 @@ func (p *p2pTransport) maintainClosestPeers(ctx context.Context, interval time.D
 
 			// 断开过远的连接（可选）
 			pruneDistantPeers(p.host, p.host.ID(), 20)
+		}
+	}
+}
+
+func (p *p2pTransport) maintainPingPong(ctx context.Context) {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-p.stop:
+			return
+		case <-ticker.C:
+			for _, pid := range p.host.Network().Peers() {
+				go func(target peer.ID) {
+					// Send PING
+					ping := &pb.Message{
+						Id:        uuid.New().String(),
+						Type:      pb.MessageType_PING,
+						Payload:   []byte("ping"),
+						Timestamp: time.Now().UnixNano(),
+					}
+					if err := p.Send(ctx, target.String(), ping); err != nil {
+						log.Warnf("failed to ping peer %s: %v", target, err)
+					} else {
+						log.Debugf("ping peer %s success", target)
+					}
+				}(pid)
+			}
 		}
 	}
 }

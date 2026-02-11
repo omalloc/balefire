@@ -9,9 +9,7 @@ import (
 )
 
 func (p *p2pTransport) sign(m *pb.Message) error {
-	if p.privKey == nil {
-		return nil // No key to sign with
-	}
+
 	// Clear signature to verify/sign the content
 	// We need to operate on a copy or temporarily clear it?
 	// Protobuf pointers... clearing it modifies the object.
@@ -21,7 +19,8 @@ func (p *p2pTransport) sign(m *pb.Message) error {
 	if err != nil {
 		return err
 	}
-	sig, err := p.privKey.Sign(b)
+	pkey := p.host.Peerstore().PrivKey(p.host.ID())
+	sig, err := pkey.Sign(b)
 	if err != nil {
 		return err
 	}

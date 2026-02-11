@@ -118,6 +118,10 @@ func (p *p2pTransport) Start(ctx context.Context) error {
 		return err
 	}
 
+	if p.opt.Mode == api.ModeServer {
+		go p.maintainPingPong(ctx)
+	}
+
 	p.host.Network().Notify(&ConnNotifiee{})
 
 	p.host.SetStreamHandler(p.protocol, p.handleStream)
@@ -215,7 +219,7 @@ func (p *p2pTransport) Send(ctx context.Context, dst string, message *pb.Message
 	}
 
 	// Close stream for writing to signal EOF to receiver
-	if err := s.Close(); err != nil {
+	if err := s.CloseWrite(); err != nil {
 		return fmt.Errorf("close stream write: %w", err)
 	}
 
@@ -250,13 +254,23 @@ func (p *p2pTransport) Send(ctx context.Context, dst string, message *pb.Message
 		if err := proto.Unmarshal(b, &reply); err != nil {
 			return fmt.Errorf("unmarshal ack: %w", err)
 		}
-		if reply.Type != pb.MessageType_ACK || reply.Id != message.Id {
-			return fmt.Errorf("invalid ACK")
+		expectedType := pb.MessageType_ACK
+		if message.Type == pb.MessageType_PING {
+			expectedType = pb.MessageType_PONG
+		}
+
+		if reply.Type != expectedType || reply.Id != message.Id {
+			return fmt.Errorf("invalid response type %s (expected %s) or ID %s != %s", reply.Type, expectedType, reply.Id, message.Id)
 		}
 
 		// Verify ACK signature
 		if err := p.verify(&reply, s.Conn().RemotePublicKey()); err != nil {
 			return fmt.Errorf("invalid ACK signature: %w", err)
+		}
+
+		// Close current connect stream
+		if err := s.Close(); err != nil {
+			return fmt.Errorf("close stream read: %w", err)
 		}
 	}
 
@@ -327,21 +341,45 @@ func (p *p2pTransport) handleStream(s network.Stream) {
 	buf, err := io.ReadAll(s)
 	if err != nil {
 		log.Errorf("read stream: %v", err)
-		s.Reset()
 		return
 	}
 
 	var msg pb.Message
 	if err := proto.Unmarshal(buf, &msg); err != nil {
 		log.Errorf("unmarshal message: %v", err)
-		s.Reset()
 		return
 	}
 
 	// Verify signature
 	if err := p.verify(&msg, s.Conn().RemotePublicKey()); err != nil {
-		log.Errorf("verify message from %s: %v", s.Conn().RemotePeer(), err)
-		s.Reset()
+		log.Errorf("verify message from %s: %v. MsgId: %s Type: %s", s.Conn().RemotePeer(), err, msg.Id, msg.Type)
+		return
+	}
+
+	// Handle PING/PONG
+	if msg.Type == pb.MessageType_PING {
+		log.Debugf("received PING from %s", s.Conn().RemotePeer())
+		pong := &pb.Message{
+			Id:      msg.Id,
+			Type:    pb.MessageType_PONG,
+			Payload: msg.Payload,
+		}
+		if err := p.sign(pong); err != nil {
+			log.Errorf("sign pong: %v", err)
+			return
+		}
+		out, err := proto.Marshal(pong)
+		if err != nil {
+			log.Errorf("marshal pong: %v", err)
+			return
+		}
+		if _, err := s.Write(out); err != nil {
+			log.Errorf("write pong: %v", err)
+		}
+		return
+	}
+	if msg.Type == pb.MessageType_PONG {
+		log.Debugf("received PONG from %s", s.Conn().RemotePeer())
 		return
 	}
 
