@@ -10,6 +10,7 @@ require (
 	github.com/libp2p/go-libp2p-kbucket v0.8.0
 	github.com/multiformats/go-multiaddr v0.16.1
 	github.com/nutsdb/nutsdb v1.1.0
+	github.com/samber/lo v1.52.0
 	github.com/stretchr/testify v1.11.1
 	google.golang.org/protobuf v1.36.11
 )

@@ -109,7 +109,7 @@ func (o *simpleOutbox) retryPendingTasks(ctx context.Context) {
 		// Check for exponential backoff
 		if nextRetryStr, ok := task.Metadata["next_retry"]; ok {
 			var nextRetry int64
-			fmt.Sscanf(nextRetryStr, "%d", &nextRetry)
+			_, _ = fmt.Sscanf(nextRetryStr, "%d", &nextRetry)
 			if time.Now().UnixNano() < nextRetry {
 				continue
 			}
@@ -118,7 +118,7 @@ func (o *simpleOutbox) retryPendingTasks(ctx context.Context) {
 		dst := task.Metadata["destination"]
 		if dst == "" {
 			log.Errorf("task %s has no destination in metadata, dropping", task.Id)
-			o.store.DeleteTask(task.Id)
+			_ = o.store.DeleteTask(task.Id)
 			continue
 		}
 
@@ -133,7 +133,7 @@ func (o *simpleOutbox) retryPendingTasks(ctx context.Context) {
 			// Update retry metadata
 			retryCount := 0
 			if countStr, ok := task.Metadata["retry_count"]; ok {
-				fmt.Sscanf(countStr, "%d", &retryCount)
+				_, _ = fmt.Sscanf(countStr, "%d", &retryCount)
 			}
 			retryCount++
 			task.Metadata["retry_count"] = fmt.Sprintf("%d", retryCount)

@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/go-kratos/kratos/v2"
 	"github.com/go-kratos/kratos/v2/config"
@@ -34,10 +35,10 @@ func init() {
 	flag.BoolVar(&flagPkey, "pk", false, "")
 
 	log.SetLogger(log.With(log.DefaultLogger,
-		"ts", log.DefaultTimestamp,
-		"service.id", id,
+		"ts", log.Timestamp(time.DateTime),
+		// "service.id", id,
 		"service.name", name,
-		"service.version", version,
+		// "service.version", version,
 	))
 }
 

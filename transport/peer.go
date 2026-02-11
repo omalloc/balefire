@@ -97,7 +97,7 @@ func pruneDistantPeers(h host.Host, target peer.ID, keepCount int) {
 
 	// 断开距离较远的连接
 	for i := keepCount; i < len(distances); i++ {
-		h.Network().ClosePeer(distances[i].pid)
+		_ = h.Network().ClosePeer(distances[i].pid)
 	}
 }
 

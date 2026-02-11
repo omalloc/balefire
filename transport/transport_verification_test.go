@@ -10,6 +10,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/crypto"
 	api "github.com/omalloc/balefire/api/transport"
 	pb "github.com/omalloc/balefire/api/transport/v1"
+	"github.com/samber/lo"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -48,7 +49,7 @@ func TestTransport_E2E_Signing(t *testing.T) {
 	}
 	trA, err := NewP2PTransport(optsA)
 	require.NoError(t, err)
-	defer trA.Stop(context.Background())
+	defer lo.Must0(trA.Stop(context.Background()))
 
 	err = trA.Start(ctx)
 	require.NoError(t, err)
@@ -77,7 +78,7 @@ func TestTransport_E2E_Signing(t *testing.T) {
 	}
 	trB, err := NewP2PTransport(optsB)
 	require.NoError(t, err)
-	defer trB.Stop(context.Background())
+	defer lo.Must0(trB.Stop(context.Background()))
 
 	// Start Node B (will connect to A and advertise)
 	err = trB.Start(ctx)
