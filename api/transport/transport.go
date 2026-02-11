@@ -4,28 +4,12 @@ import (
 	"context"
 
 	"github.com/go-kratos/kratos/v2/transport"
+
+	transportv1 "github.com/omalloc/balefire/api/transport/v1"
 )
-
-type Kind int
-
-const (
-	KindPing Kind = iota
-	KindPong
-	KindData
-	KindACK
-)
-
-type Message interface {
-	GetKind() Kind
-	GetID() string
-	GetPayload() []byte
-
-	Marshal() ([]byte, error)
-	Unmarshal(data []byte) error
-}
 
 // Handler processes incoming messages.
-type Handler func(ctx context.Context, message Message) error
+type Handler func(ctx context.Context, message *transportv1.Message) error
 
 type Mode string
 
@@ -42,7 +26,7 @@ type Transport interface {
 	transport.Server
 
 	// Send sends a message to the specified destination.
-	Send(ctx context.Context, dst string, message Message) error
+	Send(ctx context.Context, dst string, message *transportv1.Message) error
 	// OnReceive registers a handler for incoming messages.
 	OnReceive(handler Handler)
 }

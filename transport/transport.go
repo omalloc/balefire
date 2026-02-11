@@ -17,14 +17,16 @@ import (
 	"github.com/libp2p/go-libp2p/core/protocol"
 	"github.com/libp2p/go-libp2p/p2p/discovery/routing"
 	"github.com/multiformats/go-multiaddr"
+	"google.golang.org/protobuf/proto"
 
-	"github.com/omalloc/balefire/api/transport"
+	api "github.com/omalloc/balefire/api/transport"
+	pb "github.com/omalloc/balefire/api/transport/v1"
 )
 
 // Note: A libp2p-backed Transport implementation will live in this package,
 // hidden behind the Transport interface to avoid leaking dependencies.
 
-var _ transport.Transport = (*p2pTransport)(nil)
+var _ api.Transport = (*p2pTransport)(nil)
 
 const (
 	defaultProtocol   = "/balefire/1.0.0"
@@ -33,7 +35,7 @@ const (
 )
 
 type Option struct {
-	Mode         transport.Mode
+	Mode         api.Mode
 	Identity     string
 	CentralPeers []string
 	ListenAddrs  []string
@@ -48,9 +50,12 @@ type p2pTransport struct {
 	kdht     *dht.IpfsDHT
 	routing  *routing.RoutingDiscovery
 	stop     chan struct{}
+
+	privKey crypto.PrivKey
+	handler api.Handler
 }
 
-func NewP2PTransport(opt Option) (transport.Transport, error) {
+func NewP2PTransport(opt Option) (api.Transport, error) {
 	tr := &p2pTransport{
 		opt:      opt,
 		protocol: protocol.ID(defaultProtocol),
@@ -63,8 +68,12 @@ func NewP2PTransport(opt Option) (transport.Transport, error) {
 
 	opts := make([]libp2p.Option, 0, 16)
 
-	if opt.Mode == transport.ModeServer {
-		opts = append(opts, tr.identity())
+	if opt.Mode == api.ModeServer {
+		opts = append(opts, tr.identity()) // identity() loads key into tr.privKey
+	} else if len(opt.Identity) > 0 {
+		// Even if not server, if we have identity (e.g. leaf with key), load it for signing
+		tr.identity()
+		opts = append(opts, libp2p.Identity(tr.privKey))
 	}
 
 	opts = append(opts,
@@ -114,7 +123,7 @@ func (p *p2pTransport) Start(ctx context.Context) error {
 	p.host.SetStreamHandler(p.protocol, p.handleStream)
 
 	// connect to central peers if in leaf mode
-	if p.opt.Mode == transport.ModeLeaf {
+	if p.opt.Mode == api.ModeLeaf {
 		// connect to central peers
 		if err := p.connCentralPeers(); err != nil {
 			return err
@@ -136,32 +145,62 @@ func (p *p2pTransport) Stop(ctx context.Context) error {
 }
 
 // OnReceive implements [transport.Transport].
-func (p *p2pTransport) OnReceive(handler transport.Handler) {
-	panic("unimplemented")
+func (p *p2pTransport) OnReceive(handler api.Handler) {
+	p.handler = handler
 }
 
 // Send implements [transport.Transport].
-func (p *p2pTransport) Send(ctx context.Context, dst string, message transport.Message) error {
-	maddr, err := multiaddr.NewMultiaddr(dst)
-	if err != nil {
-		return fmt.Errorf("parse multiaddr: %w", err)
-	}
-	peerId, err := peer.AddrInfoFromP2pAddr(maddr)
-	if err != nil {
-		return fmt.Errorf("addr info: %w", err)
+// Send implements [transport.Transport].
+func (p *p2pTransport) Send(ctx context.Context, dst string, message *pb.Message) error {
+	var targetPeer peer.ID
+
+	// 1. Try parse as Multiaddr first (legacy/direct support)
+	if ma, err := multiaddr.NewMultiaddr(dst); err == nil {
+		if info, err := peer.AddrInfoFromP2pAddr(ma); err == nil {
+			targetPeer = info.ID
+			// If we have a direct address, try to connect if not connected
+			if len(p.host.Network().ConnsToPeer(targetPeer)) == 0 {
+				if err := p.host.Connect(ctx, *info); err != nil {
+					log.Warnf("failed to connect to %s directly: %v", dst, err)
+					// Fallthrough to DHT lookup
+				}
+			}
+		}
 	}
 
-	if len(p.host.Network().ConnsToPeer(peerId.ID)) <= 0 {
-		return fmt.Errorf("not connected to peer %s", peerId.ID.String())
+	// 2. If not parsed as multiaddr or fallback, try parse as PeerID
+	if targetPeer == "" {
+		if pid, err := peer.Decode(dst); err == nil {
+			targetPeer = pid
+		} else {
+			return fmt.Errorf("invalid destination (not multiaddr or peerID): %s", dst)
+		}
 	}
 
-	s, err := p.host.NewStream(ctx, peerId.ID, p.protocol)
+	// 3. Ensure connection exists
+	if len(p.host.Network().ConnsToPeer(targetPeer)) == 0 {
+		log.Infof("peer %s not connected, searching in DHT...", targetPeer)
+		info, err := p.kdht.FindPeer(ctx, targetPeer)
+		if err != nil {
+			return fmt.Errorf("dht find peer %s: %w", targetPeer, err)
+		}
+		if err := p.host.Connect(ctx, info); err != nil {
+			return fmt.Errorf("connect to peer %s: %w", targetPeer, err)
+		}
+	}
+
+	s, err := p.host.NewStream(ctx, targetPeer, p.protocol)
 	if err != nil {
 		return fmt.Errorf("create stream: %w", err)
 	}
 	defer s.Close()
 
-	buf, err := message.Marshal()
+	// Sign the message
+	if err := p.sign(message); err != nil {
+		return fmt.Errorf("sign message: %w", err)
+	}
+
+	buf, err := proto.Marshal(message)
 	if err != nil {
 		return fmt.Errorf("marshal message: %w", err)
 	}
@@ -175,6 +214,11 @@ func (p *p2pTransport) Send(ctx context.Context, dst string, message transport.M
 		return fmt.Errorf("incomplete write to stream")
 	}
 
+	// Close stream for writing to signal EOF to receiver
+	if err := s.Close(); err != nil {
+		return fmt.Errorf("close stream write: %w", err)
+	}
+
 	// Read reply (blocks until remote closes). Use a goroutine and abort on context.
 	ackCh := make(chan []byte, 1)
 	errCh := make(chan error, 1)
@@ -184,13 +228,13 @@ func (p *p2pTransport) Send(ctx context.Context, dst string, message transport.M
 		if err != nil {
 			select {
 			case errCh <- err:
-			default:
+			case <-ctx.Done():
 			}
 			return
 		}
 		select {
 		case ackCh <- b:
-		default:
+		case <-ctx.Done():
 		}
 	}()
 
@@ -202,12 +246,17 @@ func (p *p2pTransport) Send(ctx context.Context, dst string, message transport.M
 	case err := <-errCh:
 		return err
 	case b := <-ackCh:
-		var reply transport.Message
-		if err := reply.Unmarshal(b); err != nil {
+		var reply pb.Message
+		if err := proto.Unmarshal(b, &reply); err != nil {
 			return fmt.Errorf("unmarshal ack: %w", err)
 		}
-		if reply.GetKind() != transport.KindACK || reply.GetID() != message.GetID() {
+		if reply.Type != pb.MessageType_ACK || reply.Id != message.Id {
 			return fmt.Errorf("invalid ACK")
+		}
+
+		// Verify ACK signature
+		if err := p.verify(&reply, s.Conn().RemotePublicKey()); err != nil {
+			return fmt.Errorf("invalid ACK signature: %w", err)
 		}
 	}
 
@@ -217,7 +266,7 @@ func (p *p2pTransport) Send(ctx context.Context, dst string, message transport.M
 // dhtMode returns the DHT mode based on the config transport mode.
 func (p *p2pTransport) dhtMode() dht.ModeOpt {
 	dhtMode := dht.ModeClient
-	if p.opt.Mode == transport.ModeServer {
+	if p.opt.Mode == api.ModeServer {
 		dhtMode = dht.ModeServer
 	}
 	return dhtMode
@@ -266,9 +315,66 @@ func (p *p2pTransport) identity() libp2p.Option {
 		return nil
 	}
 
+	tr := p
+	tr.privKey = pk
 	return libp2p.Identity(pk)
 }
 
 func (p *p2pTransport) handleStream(s network.Stream) {
-	log.Infof("new stream from %s", s.Conn().RemotePeer().String())
+	defer s.Close()
+
+	// Read message
+	buf, err := io.ReadAll(s)
+	if err != nil {
+		log.Errorf("read stream: %v", err)
+		s.Reset()
+		return
+	}
+
+	var msg pb.Message
+	if err := proto.Unmarshal(buf, &msg); err != nil {
+		log.Errorf("unmarshal message: %v", err)
+		s.Reset()
+		return
+	}
+
+	// Verify signature
+	if err := p.verify(&msg, s.Conn().RemotePublicKey()); err != nil {
+		log.Errorf("verify message from %s: %v", s.Conn().RemotePeer(), err)
+		s.Reset()
+		return
+	}
+
+	// Handle message
+	ctx := context.Background() // TODO: inherit or create context
+	if p.handler != nil {
+		if err := p.handler(ctx, &msg); err != nil {
+			log.Errorf("handle message: %v", err)
+			// TODO: Send error response?
+		}
+	} else {
+		log.Warnf("no handler registered")
+	}
+
+	// Send ACK
+	ack := &pb.Message{
+		Id:   msg.Id,
+		Type: pb.MessageType_ACK,
+	}
+
+	if err := p.sign(ack); err != nil {
+		log.Errorf("sign ack: %v", err)
+		return
+	}
+
+	out, err := proto.Marshal(ack)
+	if err != nil {
+		log.Errorf("marshal ack: %v", err)
+		return
+	}
+
+	if _, err := s.Write(out); err != nil {
+		log.Errorf("write ack: %v", err)
+		return
+	}
 }

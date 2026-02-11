@@ -100,3 +100,47 @@ B. 分片多路径传输 (Multi-path Swarming)
 通过上述设计，balefire 烽火任务传递通道能够在不稳定网络环境下，确保任务的可靠传递和执行，提升整体系统的健壮性和用户体验。
 
 底层传输(Transport)实现请使用 Libp2p (https://github.com/libp2p/go-libp2p) 作为底层网络通信库，以简化 P2P 网络的实现和管理。
+
+## 技术实现细节 (Technical Implementation Details)
+
+### 1. 通信协议 (Protocol Buffers)
+
+为了保证高效传输和协议的可扩展性，我们使用 Protobuf 定义消息格式。
+
+```protobuf
+syntax = "proto3";
+package transport.v1;
+
+enum MessageType {
+  PING = 0;       // 心跳检测
+  PONG = 1;       // 心跳响应
+  DATA = 2;       // 数据载荷
+  ACK = 3;        // 确认回执
+}
+
+message Message {
+  string id = 1;                  // UUID，全局唯一消息ID
+  MessageType type = 2;           // 消息类型
+  bytes payload = 3;              // 实际数据载荷
+  int64 timestamp = 4;            // 发送时间戳 (Unix Nano)
+  map<string, string> metadata = 5; // 元数据 (TraceID, Priority, etc.)
+  bytes signature = 6;            // Ed25519 签名，防篡改
+}
+```
+
+### 2. 本地存储选型
+
+为了实现可靠的任务持久化和发件箱模式 (Outbox Pattern)，我们选用嵌入式键值数据库 **NutsDB**。
+
+- **优势**: 纯 Go 实现，无需 CGO，支持事务，性能足够满足客户端需求。
+- **存储结构**:
+  - `Bucket: PendingTasks`: 存储待发送任务 (Key: TaskID, Value: SerializedTask)
+  - `Bucket: SentTasks`: 存储已发送但未确认的任务 (Key: TaskID, Value: SerializedTask + SendTime)
+  - `Bucket: Dedup`: 去重表 (Key: TaskID, Value: ReceivedTime, TTL: 24h)
+
+### 3. Libp2p 模块使用
+
+- **Host**: 基本节点，管理连接和流。
+- **Stream**: 使用流式传输 Protobuf 编码的消息。
+- **DHT (Kademlia)**: 用于节点发现和路由。
+- **NAT**: 启用 AutoNAT 和 Relay Service (Circuit Relay v2) 穿透防火墙。
